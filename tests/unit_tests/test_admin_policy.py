@@ -11,6 +11,7 @@ import time
 from typing import Iterator, Optional, Tuple
 from unittest import mock
 
+import networkx as nx
 import pytest
 import requests
 
@@ -963,6 +964,146 @@ def test_slurm_filesystem_routing_policy(add_example_policy_paths, task):
     required = frozenset(['/data/mnist', '/scratch'])
     assert ('cluster-a', required) in slurm_policy._filesystem_cache
     assert ('cluster-b', required) in slurm_policy._filesystem_cache
+
+
+def test_criticality_tier_policy(add_example_policy_paths, task):
+    from example_policy.skypilot_policy import CriticalityTierPolicy
+    config_path = os.path.join(POLICY_PATH, 'criticality_tier.yaml')
+
+    # No label: the request is unchanged.
+    task.set_resources([sky.Resources(accelerators={'V100': 1})])
+    dag, _ = _load_task_and_apply_policy(task, config_path)
+    assert [r.use_spot for r in dag.tasks[0].resources] == [False]
+
+    # critical: on-demand. A pinned zone is kept unless the admin widens it.
+    def pinned_critical():
+        task.set_resources({
+            sky.Resources(infra='aws/us-east-1/us-east-1a',
+                          accelerators={'V100': 1},
+                          use_spot=True,
+                          labels={'criticality': 'critical'})
+        })
+        dag, _ = _load_task_and_apply_policy(task, config_path)
+        (r,) = dag.tasks[0].resources
+        return r
+
+    r = pinned_critical()
+    assert not r.use_spot and r.zone == 'us-east-1a'
+    assert r.labels['criticality'] == 'critical'
+    with mock.patch.object(CriticalityTierPolicy, 'WIDEN_PINNED_ZONE', True):
+        r = pinned_critical()
+    assert not r.use_spot and r.region == 'us-east-1' and r.zone is None
+
+    # standard: an ordered list, spot first, then on-demand. Spot and
+    # on-demand copies of one GPU request collapse to one of each, and
+    # CPU-only resources are unchanged and come last.
+    task.set_resources({
+        sky.Resources(accelerators={'V100': 1},
+                      labels={'criticality': 'standard'}),
+        sky.Resources(accelerators={'V100': 1},
+                      use_spot=True,
+                      labels={'criticality': 'standard'}),
+        sky.Resources(cpus='4+', labels={'criticality': 'standard'}),
+    })
+    dag, _ = _load_task_and_apply_policy(task, config_path)
+    resources = dag.tasks[0].resources
+    assert isinstance(resources, list)
+    assert [(bool(r.accelerators), r.use_spot) for r in resources
+           ] == [(True, True), (True, False), (False, False)]
+
+    # Labels are matched case-insensitively, also across resources.
+    task.set_resources({
+        sky.Resources(accelerators={'V100': 1},
+                      labels={'criticality': 'Standard'}),
+        sky.Resources(accelerators={'A100': 1},
+                      labels={'criticality': 'STANDARD'}),
+    })
+    dag, _ = _load_task_and_apply_policy(task, config_path)
+    assert [r.use_spot for r in dag.tasks[0].resources
+           ] == [True, True, False, False]
+
+    # Listing a tier only in SPOT_ONLY_TIERS makes it wait for spot.
+    task.set_resources({
+        sky.Resources(accelerators={'V100': 1},
+                      labels={'criticality': 'standard'})
+    })
+    with mock.patch.object(CriticalityTierPolicy, 'SPOT_ONLY_TIERS',
+                           ('standard',)):
+        dag, _ = _load_task_and_apply_policy(task, config_path)
+    assert [r.use_spot for r in dag.tasks[0].resources] == [True]
+
+    # Admins can add their own tier names.
+    task.set_resources({
+        sky.Resources(accelerators={'V100': 1},
+                      labels={'criticality': 'preemptible'})
+    })
+    with mock.patch.object(CriticalityTierPolicy, 'SPOT_ONLY_TIERS',
+                           ('preemptible',)):
+        dag, _ = _load_task_and_apply_policy(task, config_path)
+    assert [r.use_spot for r in dag.tasks[0].resources] == [True]
+
+    # Unknown tiers and conflicting tiers are rejected.
+    with pytest.raises(exceptions.UserRequestRejectedByPolicy, match='Unknown'):
+        _load_task_and_apply_policy(task, config_path)
+    task.set_resources({
+        sky.Resources(accelerators={'V100': 1},
+                      labels={'criticality': 'critical'}),
+        sky.Resources(accelerators={'A100': 1},
+                      labels={'criticality': 'standard'}),
+    })
+    with pytest.raises(exceptions.UserRequestRejectedByPolicy,
+                       match='different'):
+        _load_task_and_apply_policy(task, config_path)
+
+
+def test_label_pipeline_criticality(add_example_policy_paths):
+    from example_policy import criticality
+
+    def gpu_task(name, labels=None):
+        t = sky.Task(name=name, run='echo')
+        t.set_resources(
+            {sky.Resources(accelerators={'V100': 1}, labels=labels)})
+        return t
+
+    # prep feeds three training runs that all feed one deploy step.
+    with sky.Dag() as dag:
+        prep = gpu_task('prep')
+        trains = [gpu_task(f'train-{i}') for i in range(3)]
+        deploy = gpu_task('deploy', labels={'criticality': 'critical'})
+        for t in trains:
+            prep >> t  # pylint: disable=pointless-statement
+            t >> deploy  # pylint: disable=pointless-statement
+
+    tiers = criticality.label_pipeline_criticality(dag)
+    # prep is the one task every other task depends on.
+    assert tiers['prep'] == 'critical'
+    assert all(tiers[f'train-{i}'] == 'standard' for i in range(3))
+    # An existing label is kept as the operator's override.
+    assert tiers['deploy'] == 'critical'
+    for t in dag.tasks:
+        (r,) = t.resources
+        assert r.labels['criticality'] == tiers[t.name]
+
+    graph = nx.relabel_nodes(dag.get_graph(), {t: t.name for t in dag.tasks})
+    names = criticality.scores(graph, priorities={'train-1': 1.0})
+    assert all(0.0 <= s <= 1.0 for s in names.values())
+    assert names['train-1'] > names['train-2']
+    # The entropy term is off by default and can be switched on.
+    history = {'train-0': [1.0, 4.0, 2.0, 8.0]}
+    off = criticality.scores(graph, runtime_history=history)
+    assert off['train-0'] == off['train-1']
+    on = criticality.scores(graph,
+                            runtime_history=history,
+                            weights={'beta': 0.35})
+    assert on['train-0'] > on['train-1']
+    ranks = criticality.pagerank(dag.get_graph())
+    assert abs(sum(ranks.values()) - 1.0) < 1e-9
+    assert criticality.runtime_entropy([]) == 0.0
+    assert criticality.runtime_entropy([3.0, 3.0, 3.0]) == 0.0
+    assert criticality.tier(0.6) == 'standard'
+    assert criticality.tier(0.8) == 'critical'
+    with pytest.raises(ValueError):
+        criticality.scores(graph, priorities={'prep': 2.0})
 
 
 def test_add_volumes_policy_server_side_vs_client_side(add_volumes_policy_cls,

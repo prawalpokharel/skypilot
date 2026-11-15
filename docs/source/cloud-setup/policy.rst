@@ -629,3 +629,55 @@ Or via the ``--env`` flag in ``sky launch`` :ref:`CLI <cli>`:
 .. literalinclude:: ../../../examples/admin_policy/slurm_filesystem_routing.yaml
     :language: yaml
     :caption: `Config YAML for using SlurmFilesystemRoutingPolicy <https://github.com/skypilot-org/skypilot/blob/master/examples/admin_policy/slurm_filesystem_routing.yaml>`_
+
+.. _criticality-tier-policy:
+
+Choose spot or on-demand by task criticality
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This policy reads a ``criticality`` label on each task and picks capacity for its GPU resources. ``critical`` tasks run on-demand. ``standard`` tasks try spot first and fall back to on-demand when no spot capacity is available. Tasks without the label are unchanged. Admins can add tiers through the class attributes, for example a ``preemptible`` tier in ``SPOT_ONLY_TIERS`` for tasks that may wait for spot capacity.
+
+Set the label in a :ref:`task YAML <yaml-spec>`:
+
+.. code-block:: yaml
+
+   resources:
+     accelerators: A100:8
+     labels:
+       criticality: standard
+
+An admin policy sees one task at a time, so it cannot look at the rest of a pipeline. To label every task of a pipeline from its structure, run the ``example_policy.criticality`` helper before submitting. It scores each task by its centrality in the pipeline graph and an optional operator priority, and writes ``critical`` or ``standard`` into the label. Labels already set by hand are kept.
+
+.. code-block:: python
+
+   import networkx as nx
+   import sky
+   from example_policy import criticality
+
+   with sky.Dag() as dag:
+       prep = sky.Task.from_yaml('prep.yaml')
+       trains = [sky.Task.from_yaml(f'train-{i}.yaml') for i in range(4)]
+       deploy = sky.Task.from_yaml('deploy.yaml')
+       for train in trains:
+           prep >> train
+           train >> deploy
+
+   criticality.label_pipeline_criticality(dag, priorities={'deploy': 1.0})
+
+   # Launch each task as a managed job that waits for the tasks it reads from.
+   job_ids = {}
+   for task in nx.topological_sort(dag.get_graph()):
+       depends_on = [job_ids[p] for p in dag.get_graph().predecessors(task)]
+       ids, _ = sky.get(sky.jobs.launch(task, depends_on=depends_on or None))
+       job_ids[task] = ids[0]
+
+A chain of tasks can also be launched as one managed job with ``sky.jobs.launch(dag)``. ``depends_on`` needs an API server that runs managed jobs in consolidation mode.
+
+.. literalinclude:: ../../../examples/admin_policy/example_policy/example_policy/skypilot_policy.py
+    :language: python
+    :pyobject: CriticalityTierPolicy
+    :caption: `CriticalityTierPolicy <https://github.com/skypilot-org/skypilot/blob/master/examples/admin_policy/example_policy/example_policy/skypilot_policy.py>`_
+
+.. literalinclude:: ../../../examples/admin_policy/criticality_tier.yaml
+    :language: yaml
+    :caption: `Config YAML for using CriticalityTierPolicy <https://github.com/skypilot-org/skypilot/blob/master/examples/admin_policy/criticality_tier.yaml>`_
